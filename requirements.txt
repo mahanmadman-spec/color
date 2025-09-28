@@ -2,3 +2,4 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 vosk==0.3.45
 requests==2.32.3
+python-multipart==0.0.9
