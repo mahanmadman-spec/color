@@ -1,8 +1,20 @@
 services:
   - type: web
-    name: german-color-recognizer
+    name: color-bridge
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install -r requirements.txt
+      python scripts/download_model.py
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: VOSK_MODEL_DIR
+        value: models/vosk-model-small-de-0.15
+      - key: VOSK_MODEL_URL
+        value: https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip
     autoDeploy: true
+    # optional persistent disk to cache the model between deploys
+    disk:
+      name: model-cache
+      mountPath: /opt/render/project/src/models
+      sizeGB: 1
