@@ -1,4 +1,3 @@
-# app.py
 # FastAPI + Vosk (German) speech bridge.
 # Endpoints:
 #   GET  /health         → { ok, model, vocab, uptime_sec }
@@ -7,8 +6,8 @@
 #   GET  /bridge         → simple browser recorder UI
 #   GET  /               → plaintext OK
 
-import os, io, time, json, queue
-from typing import Dict, Set, Optional, List, Tuple
+import os, io, time, json, queue, zipfile, tempfile, shutil, urllib.request
+from typing import Dict, Set, Optional, List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
@@ -21,8 +20,13 @@ import soundfile as sf
 
 START_TS = time.monotonic()
 
+# Model config (can override via Render env)
 MODEL_DIR  = os.getenv("VOSK_MODEL_DIR", "models/vosk-model-small-de-0.15")
+MODEL_URL  = os.getenv("VOSK_MODEL_URL", "https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip")
+
+# Vocabulary config
 VOCAB_PATH = os.getenv("VOCAB_PATH", "vocab/colors_de.txt")
+
 MAX_QUEUE_LEN_PER_CODE = 64
 
 DEFAULT_VOCAB: Set[str] = {
@@ -32,7 +36,6 @@ DEFAULT_VOCAB: Set[str] = {
 }
 
 ALIASES: Dict[str, str] = {
-    # map accented forms and common variants to ASCII tokens used in-game
     "weiß":"weiss","weiss":"weiss",
     "grün":"gruen","gruen":"gruen",
     "türkis":"tuerkis","turkis":"tuerkis",
@@ -40,6 +43,8 @@ ALIASES: Dict[str, str] = {
     "hell-grün":"hellgruen","dunkel-grün":"dunkelgruen",
     "violet":"violett","purple":"violett",
 }
+
+# ------------------------------- helpers --------------------------------------
 
 def load_vocab(path: str) -> Set[str]:
     try:
@@ -55,14 +60,11 @@ def normalize_token(s: str) -> Optional[str]:
     if not s:
         return None
     s = s.strip().lower()
-    # keep letters, spaces, hyphens; drop other symbols
     s = "".join(ch if ("a" <= ch <= "z" or ch in " äöüß-") else " " for ch in s)
     s = " ".join(s.split())
     if not s:
         return None
-    # full-alias first
     s = ALIASES.get(s, s)
-    # then word-wise pick
     parts = s.replace("-", "").split()
     for w in parts:
         w = ALIASES.get(w, w)
@@ -70,12 +72,53 @@ def normalize_token(s: str) -> Optional[str]:
             return w
     return None
 
-# ------------------------------- model ----------------------------------------
+def model_ok(path: str) -> bool:
+    # Vosk small models include graph/Gr.fst; this is a reliable check
+    return os.path.exists(os.path.join(path, "graph", "Gr.fst"))
 
-try:
-    MODEL = Model(MODEL_DIR)
-except Exception as e:
-    raise RuntimeError(f"Failed to load Vosk model from '{MODEL_DIR}': {e}")
+def ensure_model(path: str, url: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if model_ok(path):
+        return
+    # Download + extract
+    tmp_zip = None
+    try:
+        print(f"[bootstrap] downloading model from {url}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            tmp_zip = tmp.name
+            with urllib.request.urlopen(url, timeout=300) as r:
+                shutil.copyfileobj(r, tmp)
+        with zipfile.ZipFile(tmp_zip, "r") as zf:
+            # Extract into models/, preserving the top-level folder
+            extract_root = os.path.abspath(os.path.join(path, os.pardir))
+            zf.extractall(extract_root)
+        # If extracted folder name differs from expected MODEL_DIR, try to find it and rename
+        if not model_ok(path):
+            parent = os.path.abspath(os.path.join(path, os.pardir))
+            for name in os.listdir(parent):
+                candidate = os.path.join(parent, name)
+                if os.path.isdir(candidate) and model_ok(candidate):
+                    if os.path.abspath(candidate) != os.path.abspath(path):
+                        try:
+                            os.replace(candidate, path)
+                        except Exception:
+                            # fallback: leave as-is; app will try to init from candidate directly
+                            pass
+                    break
+        if not model_ok(path):
+            raise RuntimeError("model extracted but structure invalid")
+    finally:
+        if tmp_zip and os.path.exists(tmp_zip):
+            try: os.remove(tmp_zip)
+            except Exception: pass
+
+# ------------------------------- model load -----------------------------------
+
+# Attempt to ensure the model is present before loading
+ensure_model(MODEL_DIR, MODEL_URL)
+
+# Load model (raises if still invalid)
+MODEL = Model(MODEL_DIR)
 
 # ------------------------------- queues ---------------------------------------
 
@@ -129,6 +172,7 @@ def health():
         "model": os.path.basename(MODEL_DIR),
         "vocab": len(VOCAB),
         "uptime_sec": round(time.monotonic() - START_TS, 2),
+        "model_ok": model_ok(MODEL_DIR),
     }
 
 @app.post("/recognize")
@@ -140,13 +184,12 @@ async def recognize(code: str = Form(...), audio: UploadFile = File(...)):
     if not raw or len(raw) < 512:
         return {"ok": True, "token": None}
 
-    # decode with libsndfile
+    # decode with libsndfile (we send WAV from /bridge; this is robust)
     try:
         data, sr = sf.read(io.BytesIO(raw), dtype="int16", always_2d=False)
     except Exception:
         return {"ok": True, "token": None, "note": "decode_failed"}
 
-    # feed to Vosk with the true sample rate
     try:
         rec = KaldiRecognizer(MODEL, float(sr))
         ok = rec.AcceptWaveform(data.tobytes())
@@ -172,7 +215,7 @@ def pull(code: str):
         raise HTTPException(status_code=400, detail="invalid code")
     return {"tokens": drain_tokens(code)}
 
-# no f-strings below; braces are plain JS, safe for Python parser
+# Plain JS/HTML (no Python f-strings here)
 HTML_BRIDGE = """
 <!doctype html><meta charset="utf-8">
 <title>Mic-Bridge</title>
