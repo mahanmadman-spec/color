@@ -1,35 +1,43 @@
-import os, sys, zipfile, shutil, tempfile
-from pathlib import Path
-import requests
-from settings import MODEL_URL, MODEL_DIR, MODEL_SUBDIR
+# Ensures the model is present at $VOSK_MODEL_DIR by downloading the zip from $VOSK_MODEL_URL
+import os, zipfile, tempfile, shutil, urllib.request, sys
 
-def ensure_model():
-    model_dir = Path(MODEL_DIR)
-    target = model_dir / MODEL_SUBDIR
-    if target.exists() and (target / "am" if (target / "am").exists() else target).exists():
-        return str(target)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as td:
-        zpath = Path(td) / "model.zip"
-        with requests.get(MODEL_URL, stream=True, timeout=120) as r:  # change: adjust timeout
-            r.raise_for_status()
-            with open(zpath, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    if chunk: f.write(chunk)
-        with zipfile.ZipFile(zpath, "r") as zf:
-            zf.extractall(td)
-        # pick first extracted dir if name unknown
-        subdirs = [p for p in Path(td).iterdir() if p.is_dir()]
-        src = None
-        for p in subdirs:
-            if "vosk-model" in p.name:
-                src = p; break
-        if src is None:
-            raise RuntimeError("Model zip did not contain a vosk-model directory")
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.move(str(src), str(target))
-    return str(target)
+MODEL_DIR = os.getenv("VOSK_MODEL_DIR", "models/vosk-model-small-de-0.15")
+MODEL_URL = os.getenv("VOSK_MODEL_URL", "https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip")
+
+def model_ok(path: str) -> bool:
+    return os.path.exists(os.path.join(path, "graph", "Gr.fst"))
+
+def ensure_model(path: str, url: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if model_ok(path):
+        print(f"[download_model] model already present: {path}")
+        return
+    tmp_zip = None
+    try:
+        print(f"[download_model] downloading {url}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            tmp_zip = tmp.name
+            with urllib.request.urlopen(url, timeout=300) as r:
+                shutil.copyfileobj(r, tmp)
+        with zipfile.ZipFile(tmp_zip, "r") as zf:
+            extract_root = os.path.abspath(os.path.join(path, os.pardir))
+            zf.extractall(extract_root)
+        # try rename if needed
+        if not model_ok(path):
+            parent = os.path.abspath(os.path.join(path, os.pardir))
+            for name in os.listdir(parent):
+                cand = os.path.join(parent, name)
+                if os.path.isdir(cand) and model_ok(cand):
+                    if os.path.abspath(cand) != os.path.abspath(path):
+                        os.replace(cand, path)
+                    break
+        if not model_ok(path):
+            raise SystemExit("[download_model] extracted, but model structure invalid")
+        print(f"[download_model] ready at {path}")
+    finally:
+        if tmp_zip and os.path.exists(tmp_zip):
+            try: os.remove(tmp_zip)
+            except Exception: pass
 
 if __name__ == "__main__":
-    print(ensure_model())
+    ensure_model(MODEL_DIR, MODEL_URL)
