@@ -1,6 +1,6 @@
 rot
 blau
-grün
+gruen
 gelb
 orange
 lila
@@ -9,8 +9,8 @@ pink
 braun
 grau
 schwarz
-weiß
-türkis
+weiss
+tuerkis
 cyan
 magenta
 beige
@@ -18,8 +18,8 @@ silber
 gold
 hellblau
 dunkelblau
-hellgrün
-dunkelgrün
+hellgruen
+dunkelgruen
 dunkelrot
 oliv
 mint
