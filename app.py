@@ -1,31 +1,22 @@
-# FastAPI + Vosk (German) speech bridge.
-# Endpoints:
-#   GET  /health         → { ok, model, vocab, uptime_sec }
-#   POST /recognize      ← form(code, file=audio-blob) → { ok, token|null }
-#   GET  /pull?code=XYZ  → { tokens: ["rot", ...] }
-#   GET  /bridge         → simple browser recorder UI
-#   GET  /               → plaintext OK
+# app.py
 
 import os, io, time, json, queue, zipfile, tempfile, shutil, urllib.request
 from typing import Dict, Set, Optional, List
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from vosk import Model, KaldiRecognizer
 import soundfile as sf
 
-# ------------------------------- config ---------------------------------------
-
 START_TS = time.monotonic()
 
-# Model config (can override via Render env)
+# VALUES TO CHANGE ONLY (optional: override via env)
 MODEL_DIR  = os.getenv("VOSK_MODEL_DIR", "models/vosk-model-small-de-0.15")
 MODEL_URL  = os.getenv("VOSK_MODEL_URL", "https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip")
-
-# Vocabulary config
 VOCAB_PATH = os.getenv("VOCAB_PATH", "vocab/colors_de.txt")
+# ================================================
 
 MAX_QUEUE_LEN_PER_CODE = 64
 
@@ -44,8 +35,6 @@ ALIASES: Dict[str, str] = {
     "violet":"violett","purple":"violett",
 }
 
-# ------------------------------- helpers --------------------------------------
-
 def load_vocab(path: str) -> Set[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -57,13 +46,11 @@ def load_vocab(path: str) -> Set[str]:
 VOCAB: Set[str] = load_vocab(VOCAB_PATH)
 
 def normalize_token(s: str) -> Optional[str]:
-    if not s:
-        return None
+    if not s: return None
     s = s.strip().lower()
     s = "".join(ch if ("a" <= ch <= "z" or ch in " äöüß-") else " " for ch in s)
     s = " ".join(s.split())
-    if not s:
-        return None
+    if not s: return None
     s = ALIASES.get(s, s)
     parts = s.replace("-", "").split()
     for w in parts:
@@ -73,88 +60,68 @@ def normalize_token(s: str) -> Optional[str]:
     return None
 
 def model_ok(path: str) -> bool:
-    # Vosk small models include graph/Gr.fst; this is a reliable check
     return os.path.exists(os.path.join(path, "graph", "Gr.fst"))
 
 def ensure_model(path: str, url: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if model_ok(path):
-        return
-    # Download + extract
+    if model_ok(path): return
     tmp_zip = None
     try:
-        print(f"[bootstrap] downloading model from {url}")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
             tmp_zip = tmp.name
             with urllib.request.urlopen(url, timeout=300) as r:
                 shutil.copyfileobj(r, tmp)
         with zipfile.ZipFile(tmp_zip, "r") as zf:
-            # Extract into models/, preserving the top-level folder
             extract_root = os.path.abspath(os.path.join(path, os.pardir))
             zf.extractall(extract_root)
-        # If extracted folder name differs from expected MODEL_DIR, try to find it and rename
         if not model_ok(path):
             parent = os.path.abspath(os.path.join(path, os.pardir))
             for name in os.listdir(parent):
-                candidate = os.path.join(parent, name)
-                if os.path.isdir(candidate) and model_ok(candidate):
-                    if os.path.abspath(candidate) != os.path.abspath(path):
-                        try:
-                            os.replace(candidate, path)
-                        except Exception:
-                            # fallback: leave as-is; app will try to init from candidate directly
-                            pass
+                cand = os.path.join(parent, name)
+                if os.path.isdir(cand) and model_ok(cand):
+                    if os.path.abspath(cand) != os.path.abspath(path):
+                        try: os.replace(cand, path)
+                        except Exception: pass
                     break
         if not model_ok(path):
-            raise RuntimeError("model extracted but structure invalid")
+            raise RuntimeError("model extracted but invalid structure")
     finally:
         if tmp_zip and os.path.exists(tmp_zip):
             try: os.remove(tmp_zip)
             except Exception: pass
 
-# ------------------------------- model load -----------------------------------
-
-# Attempt to ensure the model is present before loading
 ensure_model(MODEL_DIR, MODEL_URL)
-
-# Load model (raises if still invalid)
 MODEL = Model(MODEL_DIR)
-
-# ------------------------------- queues ---------------------------------------
 
 QUEUES: Dict[str, "queue.Queue[str]"] = {}
 QLEN: Dict[str, int] = {}
 
-def q_for(code: str) -> "queue.Queue[str]":
-    code = code.strip()
-    if code not in QUEUES:
-        QUEUES[code] = queue.Queue()
-        QLEN[code] = 0
-    return QUEUES[code]
+def q_for(key: str) -> "queue.Queue[str]":
+    key = key.strip()
+    if key not in QUEUES:
+        QUEUES[key] = queue.Queue()
+        QLEN[key] = 0
+    return QUEUES[key]
 
-def push_token(code: str, token: str) -> None:
-    q = q_for(code)
-    if QLEN.get(code, 0) >= MAX_QUEUE_LEN_PER_CODE:
+def push_token(key: str, token: str) -> None:
+    q = q_for(key)
+    if QLEN.get(key, 0) >= MAX_QUEUE_LEN_PER_CODE:
         try:
             q.get_nowait()
-            QLEN[code] = max(0, QLEN[code] - 1)
-        except Exception:
-            pass
+            QLEN[key] = max(0, QLEN.get(key, 0) - 1)
+        except Exception: pass
     q.put(token)
-    QLEN[code] = QLEN.get(code, 0) + 1
+    QLEN[key] = QLEN.get(key, 0) + 1
 
-def drain_tokens(code: str) -> List[str]:
+def drain_tokens(key: str) -> List[str]:
     out: List[str] = []
-    q = q_for(code)
+    q = q_for(key)
     try:
         while True:
             out.append(q.get_nowait())
-            QLEN[code] = max(0, QLEN.get(code, 0) - 1)
-    except Exception:
-        pass
+            QLEN[key] = max(0, QLEN.get(key, 0) - 1)
+    except Exception: pass
     return out
-
-# ------------------------------- app ------------------------------------------
 
 app = FastAPI()
 app.add_middleware(
@@ -162,8 +129,6 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=False,
     allow_methods=["*"], allow_headers=["*"],
 )
-
-# ------------------------------- endpoints ------------------------------------
 
 @app.get("/health")
 def health():
@@ -176,46 +141,45 @@ def health():
     }
 
 @app.post("/recognize")
-async def recognize(code: str = Form(...), audio: UploadFile = File(...)):
-    if not code or len(code) > 64:
+async def recognize(
+    code: Optional[str] = Form(None),
+    uid:  Optional[str] = Form(None),
+    audio: UploadFile = File(...),
+):
+    key = (code or uid or "").strip()
+    if not key or len(key) > 64:
         raise HTTPException(status_code=400, detail="invalid code")
-
     raw = await audio.read()
     if not raw or len(raw) < 512:
         return {"ok": True, "token": None}
-
-    # decode with libsndfile (we send WAV from /bridge; this is robust)
     try:
         data, sr = sf.read(io.BytesIO(raw), dtype="int16", always_2d=False)
     except Exception:
         return {"ok": True, "token": None, "note": "decode_failed"}
-
     try:
         rec = KaldiRecognizer(MODEL, float(sr))
         ok = rec.AcceptWaveform(data.tobytes())
         txt = rec.FinalResult() if ok else rec.PartialResult()
     except Exception:
         return {"ok": True, "token": None}
-
     try:
         j = json.loads(txt)
         hyp = (j.get("text") or j.get("partial") or "").strip()
     except Exception:
         hyp = ""
-
     token = normalize_token(hyp)
     if token:
-        push_token(code, token)
+        push_token(key, token)
         return {"ok": True, "token": token}
     return {"ok": True, "token": None}
 
 @app.get("/pull")
-def pull(code: str):
-    if not code or len(code) > 64:
+def pull(code: Optional[str] = Query(None), uid: Optional[str] = Query(None)):
+    key = (code or uid or "").strip()
+    if not key or len(key) > 64:
         raise HTTPException(status_code=400, detail="invalid code")
-    return {"tokens": drain_tokens(code)}
+    return {"tokens": drain_tokens(key)}
 
-# Plain JS/HTML (no Python f-strings here)
 HTML_BRIDGE = """
 <!doctype html><meta charset="utf-8">
 <title>Mic-Bridge</title>
@@ -223,7 +187,7 @@ HTML_BRIDGE = """
 body{font:16px system-ui,Segoe UI,Arial;margin:24px;max-width:880px;background:#0b0b0f;color:#eaeaf0}
 h1{font-size:22px;margin:0 0 14px}
 label,input,button{font:inherit}
-input#code{font:700 22px ui-monospace,Consolas,monospace;width:14ch;text-transform:uppercase;padding:6px 8px;border-radius:8px;border:1px solid #334}
+input#code{font:700 22px ui-monospace,Consolas,monospace;width:14ch;text-transform:none;padding:6px 8px;border-radius:8px;border:1px solid #334}
 button{padding:8px 14px;border-radius:10px;border:1px solid #46f;background:#9df;color:#012;font-weight:700;cursor:pointer}
 #hint{margin-left:12px;opacity:.85}
 #log{white-space:pre-wrap;background:#10131a;border:1px solid #233;padding:12px;border-radius:10px;margin-top:16px;min-height:120px}
@@ -231,14 +195,14 @@ button{padding:8px 14px;border-radius:10px;border:1px solid #46f;background:#9df
 kbd{background:#222;border:1px solid #444;padding:2px 5px;border-radius:4px}
 </style>
 <h1>Mic-Bridge</h1>
-<p>Enter the code you see in Roblox. Keep this tab open while you play.</p>
+<p>Enter your in-game code (e.g. your Roblox UserId). Keep this tab open.</p>
 <p>
   <label for="code">Code:</label>
-  <input id="code" placeholder="XXXXXXXX" maxlength="16">
+  <input id="code" placeholder="1192628416" maxlength="32">
   <button id="go">Start</button>
   <span id="hint"></span>
 </p>
-<div class="small">If your browser asks for microphone access, allow it.</div>
+<div class="small">Allow microphone access when prompted.</div>
 <div id="log"></div>
 
 <script>
@@ -336,7 +300,6 @@ async function start(){
     return;
   }
 
-  // Fallback: ScriptProcessor
   const frame = 2048;
   const proc = ctx.createScriptProcessor(frame, 1, 1);
   let acc = [], accLen = 0;
@@ -366,8 +329,6 @@ def bridge():
 @app.get("/")
 def root():
     return PlainTextResponse("OK. See /health, /bridge, /recognize, /pull.")
-
-# ------------------------------- errors ---------------------------------------
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
