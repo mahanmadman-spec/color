@@ -1,4 +1,5 @@
 __pycache__/
-models/
-*.zip
+*.pyc
 .env
+models/*
+!models/.keep
